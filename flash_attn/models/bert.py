@@ -677,7 +677,7 @@ def bge_remap_state_dict(state_dict, config: PretrainedConfig):
 def remap_state_dict(state_dict, config: PretrainedConfig):
     """
     Map the state_dict of a Huggingface BERT model to be flash_attn compatible.
-    """  
+    """
 
     # LayerNorm
     def key_mapping_ln_gamma_beta(key):
