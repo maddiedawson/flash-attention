@@ -21,7 +21,6 @@ from transformers.models.bert.modeling_bert import (
     BaseModelOutputWithPoolingAndCrossAttentions,
     BertForPreTrainingOutput,
 )
-from transformers.modeling_outputs import MaskedLMOutput
 
 from flash_attn.bert_padding import (
     index_first_axis,
@@ -309,16 +308,6 @@ class BertPreTrainingHeads(nn.Module):
         return prediction_scores, seq_relationship_score
 
 
-class BertOnlyMLMHead(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.predictions = BertLMPredictionHead(config)
-
-    def forward(self, sequence_output: torch.Tensor) -> torch.Tensor:
-        prediction_scores = self.predictions(sequence_output)
-        return prediction_scores
-
-
 class BertPreTrainedModel(nn.Module):
     """An abstract class to handle weights initialization and
     a simple interface for dowloading and loading pretrained models.
@@ -340,7 +329,7 @@ class BertPreTrainedModel(nn.Module):
     def from_pretrained(cls, model_name, config, *inputs, **kwargs):
         """
         Instantiate a BertPreTrainedModel from a pre-trained model file or a pytorch state dict.
-        Download and cache txhe pre-trained model file if needed.
+        Download and cache the pre-trained model file if needed.
 
         Params:
             pretrained_model_name_or_path: either:
