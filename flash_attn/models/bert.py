@@ -10,7 +10,7 @@ import re
 from collections import OrderedDict
 from collections.abc import Sequence
 from functools import partial
-from typing import Any, Mapping, Optional, Tuple, Union
+from typing import Any, Mapping, Optional
 
 import torch
 import torch.nn as nn
@@ -551,6 +551,10 @@ class BertForPreTraining(BertPreTrainedModel):
 def bge_remap_state_dict(state_dict, config: PretrainedConfig):
     """
     Map the state_dict of a BGE Bert to be flash_attn compatible.
+    The BGE model has slightly different names than a typical BERT model,
+    so it must be remapped differently.
+    Note: We do not update inv_remap_state_dict, because we do not need it.
+    As it stands, it will not work with a BGE model.
     """
     
     # LayerNorm
