@@ -89,8 +89,7 @@ class BertEmbeddings(nn.Module):
             )
         if self.type_vocab_size > 0:
             self.token_type_embeddings = nn.Embedding(type_vocab_size, embed_dim, **factory_kwargs)
-
-        
+     
     def forward(self, input_ids, position_ids=None, token_type_ids=None):
         """
         input_ids: (batch, seqlen)
