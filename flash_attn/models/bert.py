@@ -237,8 +237,6 @@ class BertPooler(nn.Module):
     def forward(self, hidden_states, pool=True):
         # We "pool" the model by simply taking the hidden state corresponding
         # to the first token.
-        if isinstance(hidden_states, tuple):
-            hidden_states = hidden_states[0]
         first_token_tensor = hidden_states[:, 0] if pool else hidden_states
         pooled_output = self.dense(first_token_tensor)
         pooled_output = self.activation(pooled_output)
@@ -442,7 +440,7 @@ class BertModel(BertPreTrainedModel):
 
         if not return_dict:
             # SentenceTransformers BERT expects a single output.
-            #return (sequence_output , pooled_output) + encoder_output[1:]
+            # return (sequence_output , pooled_output) + encoder_output[1:]
             return sequence_output
 
         return BaseModelOutputWithPoolingAndCrossAttentions(
