@@ -10,7 +10,7 @@ import re
 from collections import OrderedDict
 from collections.abc import Sequence
 from functools import partial
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -21,6 +21,7 @@ from transformers.models.bert.modeling_bert import (
     BaseModelOutputWithPoolingAndCrossAttentions,
     BertForPreTrainingOutput,
 )
+from transformers.modeling_outputs import MaskedLMOutput
 
 from flash_attn.bert_padding import (
     index_first_axis,
@@ -156,7 +157,7 @@ class BertEncoder(nn.Module):
             [create_block(config, layer_idx=i) for i in range(config.num_hidden_layers)]
         )
 
-    def forward(self, hidden_states, key_padding_mask=None, subset_mask=None):
+    def forward(self, hidden_states, key_padding_mask=None, subset_mask=None, return_dict: Optional[bool] = True):
         """If subset_mask is not None, we only want output for the subset of the sequence.
         This means that we only compute the last layer output for these tokens.
         subset_mask: (batch, seqlen), dtype=torch.bool
@@ -208,6 +209,19 @@ class BertEncoder(nn.Module):
                     "max_seqlen_k": max_seqlen_in_batch,
                 }
                 hidden_states = self.layers[-1](hidden_states_subset, mixer_kwargs=mixer_kwargs)
+        
+        if not return_dict:
+            return tuple(
+                v
+                for v in [
+                    hidden_states,
+                    None,
+                    None,
+                    None,
+                    None,
+                ]
+                if v is not None
+            )
         return hidden_states
 
 
@@ -224,6 +238,8 @@ class BertPooler(nn.Module):
     def forward(self, hidden_states, pool=True):
         # We "pool" the model by simply taking the hidden state corresponding
         # to the first token.
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
         first_token_tensor = hidden_states[:, 0] if pool else hidden_states
         pooled_output = self.dense(first_token_tensor)
         pooled_output = self.activation(pooled_output)
@@ -293,6 +309,16 @@ class BertPreTrainingHeads(nn.Module):
         return prediction_scores, seq_relationship_score
 
 
+class BertOnlyMLMHead(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.predictions = BertLMPredictionHead(config)
+
+    def forward(self, sequence_output: torch.Tensor) -> torch.Tensor:
+        prediction_scores = self.predictions(sequence_output)
+        return prediction_scores
+
+
 class BertPreTrainedModel(nn.Module):
     """An abstract class to handle weights initialization and
     a simple interface for dowloading and loading pretrained models.
@@ -314,7 +340,7 @@ class BertPreTrainedModel(nn.Module):
     def from_pretrained(cls, model_name, config, *inputs, **kwargs):
         """
         Instantiate a BertPreTrainedModel from a pre-trained model file or a pytorch state dict.
-        Download and cache the pre-trained model file if needed.
+        Download and cache txhe pre-trained model file if needed.
 
         Params:
             pretrained_model_name_or_path: either:
@@ -330,7 +356,7 @@ class BertPreTrainedModel(nn.Module):
         # Instantiate model.
         model = cls(config, *inputs, **kwargs)
         load_return = model.load_state_dict(
-            remap_state_dict(state_dict_from_pretrained(model_name), config), strict=False
+            bge_remap_state_dict(state_dict_from_pretrained(model_name), config), strict=False
         )
         logger.info(load_return)
         return model
@@ -354,13 +380,12 @@ class BertModel(BertPreTrainedModel):
             config.vocab_size,
             config.max_position_embeddings,
             config.type_vocab_size,
-            padding_idx=config.pad_token_id,
+            padding_idx=config.pad_token_id
         )
         self.emb_drop = nn.Dropout(config.hidden_dropout_prob)
         self.emb_ln = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.encoder = BertEncoder(config)
         self.pooler = BertPooler(config) if add_pooling_layer else None
-
         self.apply(partial(_init_weights, initializer_range=config.initializer_range))
 
     def forward(
@@ -370,12 +395,15 @@ class BertModel(BertPreTrainedModel):
         token_type_ids=None,
         attention_mask=None,
         masked_tokens_mask=None,
+        return_dict: Optional[bool] = None,
     ):
         """If masked_tokens_mask is not None (i.e. last_layer_subset == True in BertForPreTraining),
         we only want the output for the masked tokens. This means that we only compute the last
         layer output for these tokens.
         masked_tokens_mask: (batch, seqlen), dtype=torch.bool
         """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
         hidden_states = self.embeddings(
             input_ids, position_ids=position_ids, token_type_ids=token_type_ids
         )
@@ -400,12 +428,17 @@ class BertModel(BertPreTrainedModel):
         else:
             subset_mask = None
 
-        sequence_output = self.encoder(
-            hidden_states, key_padding_mask=attention_mask, subset_mask=subset_mask
+        attention_mask=attention_mask.bool() if attention_mask is not None else None
+        encoder_output = self.encoder(
+            hidden_states, key_padding_mask=attention_mask, subset_mask=subset_mask,
+            return_dict=return_dict
         )
+        sequence_output = encoder_output
 
         if masked_tokens_mask is None:
-            pooled_output = self.pooler(sequence_output) if self.pooler is not None else None
+            pass
+            # BGE does not use pooled output and masked_tokens_mask is None.
+            # pooled_output = self.pooler(sequence_output) if self.pooler is not None else None
         else:
             # TD [2022-03-01]: the indexing here is very tricky.
             if attention_mask is not None:
@@ -415,7 +448,13 @@ class BertModel(BertPreTrainedModel):
             else:
                 pool_input = sequence_output[first_col_mask[subset_mask]]
                 sequence_output = sequence_output[masked_tokens_mask[subset_mask]]
-            pooled_output = self.pooler(pool_input, pool=False) if self.pooler is not None else None
+            # BGE does not use pooled output.
+            # pooled_output = self.pooler(pool_input, pool=False) if self.pooler is not None else None
+
+        if not return_dict:
+            # SentenceTransformers BERT expects a single output.
+            #return (sequence_output , pooled_output) + encoder_output[1:]
+            return sequence_output
 
         return BaseModelOutputWithPoolingAndCrossAttentions(
             last_hidden_state=sequence_output,
@@ -520,10 +559,125 @@ class BertForPreTraining(BertPreTrainedModel):
         )
 
 
+def bge_remap_state_dict(state_dict, config: PretrainedConfig):
+    """
+    Map the state_dict of a BGE Bert to be flash_attn compatible.
+    """
+    
+    # LayerNorm
+    def key_mapping_ln_gamma_beta(key):
+        key = re.sub(r"LayerNorm.gamma$", "LayerNorm.weight", key)
+        key = re.sub(r"LayerNorm.beta$", "LayerNorm.bias", key)
+        return key
+
+    state_dict = OrderedDict((key_mapping_ln_gamma_beta(k), v) for k, v in state_dict.items())
+
+    # Layers
+    def key_mapping_layers(key):
+        return re.sub(r"^encoder.layer.", "encoder.layers.", key)
+
+    state_dict = OrderedDict((key_mapping_layers(k), v) for k, v in state_dict.items())
+
+    # LayerNorm
+    def key_mapping_ln(key):
+        key = re.sub(r"^embeddings.LayerNorm.", "emb_ln.", key)
+        key = re.sub(
+            r"^encoder.layers.(\d+).attention.output.LayerNorm.(weight|bias)",
+            r"encoder.layers.\1.norm1.\2",
+            key,
+        )
+        key = re.sub(
+            r"^encoder.layers.(\d+).output.LayerNorm.(weight|bias)",
+            r"encoder.layers.\1.norm2.\2",
+            key,
+        )
+        key = re.sub(
+            r"^cls.predictions.transform.LayerNorm.(weight|bias)",
+            r"cls.predictions.transform.layer_norm.\1",
+            key,
+        )
+        return key
+
+    state_dict = OrderedDict((key_mapping_ln(k), v) for k, v in state_dict.items())
+
+    # MLP
+    def key_mapping_mlp(key):
+        key = re.sub(
+            r"^encoder.layers.(\d+).intermediate.dense.(weight|bias)",
+            r"encoder.layers.\1.mlp.fc1.\2",
+            key,
+        )
+        key = re.sub(
+            r"^encoder.layers.(\d+).output.dense.(weight|bias)",
+            r"encoder.layers.\1.mlp.fc2.\2",
+            key,
+        )
+        return key
+
+    state_dict = OrderedDict((key_mapping_mlp(k), v) for k, v in state_dict.items())
+
+    # print("Updated state dict:", state_dict)
+
+    # Attention
+    last_layer_subset = getattr(config, "last_layer_subset", False)
+    for d in range(config.num_hidden_layers):
+        Wq = state_dict.pop(f"encoder.layers.{d}.attention.self.query.weight")
+        Wk = state_dict.pop(f"encoder.layers.{d}.attention.self.key.weight")
+        Wv = state_dict.pop(f"encoder.layers.{d}.attention.self.value.weight")
+        bq = state_dict.pop(f"encoder.layers.{d}.attention.self.query.bias")
+        bk = state_dict.pop(f"encoder.layers.{d}.attention.self.key.bias")
+        bv = state_dict.pop(f"encoder.layers.{d}.attention.self.value.bias")
+        if not (last_layer_subset and d == config.num_hidden_layers - 1):
+            state_dict[f"encoder.layers.{d}.mixer.Wqkv.weight"] = torch.cat(
+                [Wq, Wk, Wv], dim=0
+            )
+            state_dict[f"encoder.layers.{d}.mixer.Wqkv.bias"] = torch.cat([bq, bk, bv], dim=0)
+        else:
+            state_dict[f"encoder.layers.{d}.mixer.Wq.weight"] = Wq
+            state_dict[f"encoder.layers.{d}.mixer.Wkv.weight"] = torch.cat([Wk, Wv], dim=0)
+            state_dict[f"encoder.layers.{d}.mixer.Wq.bias"] = bq
+            state_dict[f"encoder.layers.{d}.mixer.Wkv.bias"] = torch.cat([bk, bv], dim=0)
+
+    def key_mapping_attn(key):
+        return re.sub(
+            r"^encoder.layers.(\d+).attention.output.dense.(weight|bias)",
+            r"encoder.layers.\1.mixer.out_proj.\2",
+            key,
+        )
+
+    state_dict = OrderedDict((key_mapping_attn(k), v) for k, v in state_dict.items())
+
+    def key_mapping_decoder_bias(key):
+        return re.sub(r"^cls.predictions.bias", "cls.predictions.decoder.bias", key)
+
+    state_dict = OrderedDict((key_mapping_decoder_bias(k), v) for k, v in state_dict.items())
+
+    # Word embedding
+    pad_vocab_size_multiple = getattr(config, "pad_vocab_size_multiple", 1)
+    if pad_vocab_size_multiple > 1:
+        word_embeddings = state_dict["embeddings.word_embeddings.weight"]
+        state_dict["embeddings.word_embeddings.weight"] = F.pad(
+            word_embeddings, (0, 0, 0, config.vocab_size - word_embeddings.shape[0])
+        )
+        decoder_weight = state_dict["cls.predictions.decoder.weight"]
+        state_dict["cls.predictions.decoder.weight"] = F.pad(
+            decoder_weight, (0, 0, 0, config.vocab_size - decoder_weight.shape[0])
+        )
+        # If the vocab was padded, we want to set the decoder bias for those padded indices to be
+        # strongly negative (i.e. the decoder shouldn't predict those indices).
+        # TD [2022-05-09]: I don't think it affects the MLPerf training.
+        decoder_bias = state_dict["cls.predictions.decoder.bias"]
+        state_dict["cls.predictions.decoder.bias"] = F.pad(
+            decoder_bias, (0, config.vocab_size - decoder_bias.shape[0]), value=-100.0
+        )
+
+    return state_dict
+
+
 def remap_state_dict(state_dict, config: PretrainedConfig):
     """
     Map the state_dict of a Huggingface BERT model to be flash_attn compatible.
-    """
+    """  
 
     # LayerNorm
     def key_mapping_ln_gamma_beta(key):
