@@ -17,8 +17,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from transformers import BertConfig, PretrainedConfig
+from transformers.modeling_outputs import BaseModelOutputWithCrossAttentions
 from transformers.models.bert.modeling_bert import (
-    BaseModelOutputWithCrossAttentions,
     BertForPreTrainingOutput,
 )
 
