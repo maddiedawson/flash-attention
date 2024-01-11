@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import BertConfig, PretrainedConfig
 from transformers.models.bert.modeling_bert import (
-    BaseModelOutputWithPoolingAndCrossAttentions,
+    BaseModelOutputWithCrossAttentions,
     BertForPreTrainingOutput,
 )
 
@@ -444,9 +444,8 @@ class BertModel(BertPreTrainedModel):
             # return (sequence_output , pooled_output) + encoder_output[1:]
             return sequence_output
 
-        return BaseModelOutputWithPoolingAndCrossAttentions(
+        return BaseModelOutputWithCrossAttentions(
             last_hidden_state=sequence_output,
-            pooler_output=pooled_output,
         )
 
 
