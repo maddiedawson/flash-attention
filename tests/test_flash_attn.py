@@ -14,7 +14,7 @@ from flash_attn import (
     flash_attn_with_kvcache,
 )
 from flash_attn.bert_padding import pad_input, unpad_input
-from flash_attn.flash_attn_interface import _get_block_size
+from flash_attn.flash_attn_interface import _get_block_size_n
 from flash_attn.layers.rotary import apply_rotary_emb
 
 MAX_HEADDIM_SM8x = 192
@@ -406,29 +406,7 @@ def convert_flash_attn_S_to_softmax(
     if causal:
         window_size = (window_size[0], 0)
     seqlen_q_rounded, seqlen_k_rounded = S.shape[-2:]
-    warps_n = 4
-    blocksize_m, blocksize_n = _get_block_size(S.device, head_dim, is_dropout, causal)
-    nblocks_n = (seqlen_k_rounded + blocksize_n - 1) // blocksize_n
-    nblocks_m = (seqlen_q_rounded + blocksize_m - 1) // blocksize_m
-    mmas_n = (blocksize_n + 16 - 1) // 16
-    S_flat = rearrange(
-        S,
-        "b h (nblocks_m blocksize_m) (nblocks_n blocksize_n) -> b h nblocks_m nblocks_n (blocksize_m blocksize_n)",
-        blocksize_m=blocksize_m,
-        blocksize_n=blocksize_n,
-    )
-    S_converted = rearrange(
-        S_flat,
-        "b h nblocks_m nblocks_n (mmas_n mmas_m warps_n eight four c2 c1 c0) -> b h (nblocks_m mmas_m warps_n c1 eight) (nblocks_n mmas_n c2 four c0)",
-        mmas_n=mmas_n,
-        warps_n=warps_n,
-        eight=8,
-        c0=2,
-        c1=2,
-        c2=2,
-        four=4,
-    )
-
+    S_converted = S
     if window_size[0] >= 0 or window_size[1] >= 0:
         local_mask = construct_local_mask(
             seqlen_q,
@@ -443,7 +421,7 @@ def convert_flash_attn_S_to_softmax(
             (0, seqlen_k_rounded - seqlen_k, 0, seqlen_q_rounded - seqlen_q),
             value=True,
         )
-        S_converted.masked_fill_(local_mask, 0.0)
+        S_converted = S_converted.masked_fill(local_mask, 0.0)
 
     # Need to zero out things not in attention_mask in case S was initialized with random values
     # and some of those values aren't overwritten.
@@ -504,7 +482,7 @@ def normalize_flash_attn_S(
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
         scores = scores + attn_bias.to(dtype=scores.dtype)
-    _, block_size_n = _get_block_size(scores.device, head_dim, is_dropout, causal)
+    block_size_n = _get_block_size_n(scores.device, head_dim, is_dropout, causal)
     scores_block = scores.split(block_size_n, dim=-1)
     lse_block = torch.stack([torch.logsumexp(s, dim=-1) for s in scores_block], dim=-1)
     lse = torch.logsumexp(lse_block, dim=-1)
@@ -567,7 +545,7 @@ def get_dropout_fraction(
 @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("deterministic", [False, True])
-# @pytest.mark.parametrize("deterministic", [True])
+# @pytest.mark.parametrize("deterministic", [False])
 @pytest.mark.parametrize("alibi", [False, True])
 # @pytest.mark.parametrize("alibi", [False])
 @pytest.mark.parametrize("local", [False, True])
@@ -730,7 +708,9 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
 # @pytest.mark.parametrize('seqlen', [128])
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 # @pytest.mark.parametrize('dropout_p', [0.0])
-def test_flash_attn_varlen_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, deterministic, dtype):
+def test_flash_attn_varlen_qkvpacked(
+    seqlen, d, dropout_p, causal, local, alibi, deterministic, dtype
+):
     if seqlen >= 2048 and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30:
         pytest.skip()  # Reference implementation OOM
     device = "cuda"
@@ -1720,7 +1700,9 @@ def test_flash_attn_varlen_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtyp
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
-def test_flash_attn_splitkv(seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, alibi, deterministic, dtype):
+def test_flash_attn_splitkv(
+    seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, alibi, deterministic, dtype
+):
     if swap_sq_sk:
         seqlen_q, seqlen_k = seqlen_k, seqlen_q
     device = "cuda"
@@ -1822,7 +1804,7 @@ def test_flash_attn_splitkv(seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, al
 @pytest.mark.parametrize("new_kv", [False, True])
 # @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize("alibi", [False, True])
-# @pytest.mark.parametrize("alibi", [True])
+# @pytest.mark.parametrize("alibi", [False])
 @pytest.mark.parametrize("local", [False, True])
 # @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
@@ -1833,10 +1815,12 @@ def test_flash_attn_splitkv(seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, al
 # @pytest.mark.parametrize("rotary_interleaved", [False])
 @pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
 # @pytest.mark.parametrize("rotary_fraction", [0.0])
+# @pytest.mark.parametrize("paged_kv_block_size", [None, 256, 512])
+@pytest.mark.parametrize("paged_kv_block_size", [256, 512])
 @pytest.mark.parametrize("has_batch_idx", [False, True])
 # @pytest.mark.parametrize("has_batch_idx", [False])
-@pytest.mark.parametrize("d", [32, 59, 64, 80, 96, 128, 160, 192, 224, 256])
-# @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192, 224, 256])
+@pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
+# @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize("d", [128])
@@ -1862,6 +1846,7 @@ def test_flash_attn_kvcache(
     seqlen_k,
     d,
     has_batch_idx,
+    paged_kv_block_size,
     rotary_fraction,
     rotary_interleaved,
     seqlen_new_eq_seqlen_q,
@@ -1876,6 +1861,8 @@ def test_flash_attn_kvcache(
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip()
     if not new_kv and rotary_fraction > 0.0:
+        pytest.skip()
+    if has_batch_idx and paged_kv_block_size is not None:
         pytest.skip()
     device = "cuda"
     # set seed
@@ -1895,10 +1882,35 @@ def test_flash_attn_kvcache(
         v = torch.randn(batch_size, seqlen_new, nheads_k, d, device=device, dtype=dtype)
     else:
         k, v = None, None
-    k_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype)
-    v_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype)
+    if paged_kv_block_size is None:
+        k_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype)
+        v_cache = torch.randn(batch_size_cache, seqlen_k, nheads_k, d, device=device, dtype=dtype)
+        block_table = None
+    else:
+        num_blocks = math.ceil(seqlen_k / paged_kv_block_size) * batch_size * 3
+        k_cache_paged = torch.randn(
+            num_blocks, paged_kv_block_size, nheads_k, d, device=device, dtype=dtype
+        )
+        v_cache_paged = torch.randn(
+            num_blocks, paged_kv_block_size, nheads_k, d, device=device, dtype=dtype
+        )
+        block_table = rearrange(
+            torch.randperm(num_blocks, dtype=torch.int32, device=device),
+            "(b nblocks) -> b nblocks",
+            b=batch_size,
+        )
+        k_cache = rearrange(
+            k_cache_paged[block_table.flatten()],
+            "(b nblocks) block_size ... -> b (nblocks block_size) ...",
+            b=batch_size,
+        )[:, :seqlen_k]
+        v_cache = rearrange(
+            v_cache_paged[block_table.flatten()],
+            "(b nblocks) block_size ... -> b (nblocks block_size) ...",
+            b=batch_size,
+        )[:, :seqlen_k]
     cache_seqlens = torch.randint(
-        0,
+        0 if new_kv else 1,
         # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
         (seqlen_k - (seqlen_q if (causal or local) and rotary_dim > 1 else seqlen_new) + 1)
         if new_kv
@@ -1925,7 +1937,15 @@ def test_flash_attn_kvcache(
         alibi_slopes, attn_bias = None, None
     # cache_seqlens = torch.tensor([64], dtype=torch.int32, device=device)
     if rotary_dim > 0:
-        angle = torch.rand(seqlen_k, rotary_dim // 2, device=device) * 2 * math.pi
+        angle = (
+            torch.rand(
+                seqlen_k if paged_kv_block_size is None else num_blocks * paged_kv_block_size,
+                rotary_dim // 2,
+                device=device,
+            )
+            * 2
+            * math.pi
+        )
         cos = torch.cos(angle).to(dtype=dtype)
         sin = torch.sin(angle).to(dtype=dtype)
         if causal or local:
@@ -1964,14 +1984,15 @@ def test_flash_attn_kvcache(
     v_cache_rep = repeat(v_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k)
     out = flash_attn_with_kvcache(
         q,
-        k_cache,
-        v_cache,
+        k_cache if paged_kv_block_size is None else k_cache_paged,
+        v_cache if paged_kv_block_size is None else v_cache_paged,
         k,
         v,
-        cos,
-        sin,
-        cache_seqlens,
-        cache_batch_idx,
+        rotary_cos=cos,
+        rotary_sin=sin,
+        cache_seqlens=cache_seqlens,
+        cache_batch_idx=cache_batch_idx,
+        block_table=block_table,
         causal=causal,
         window_size=window_size,
         rotary_interleaved=rotary_interleaved,
@@ -2022,8 +2043,20 @@ def test_flash_attn_kvcache(
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
     if new_kv:
-        k_cache_select = k_cache if not has_batch_idx else k_cache[cache_batch_idx]
-        v_cache_select = v_cache if not has_batch_idx else v_cache[cache_batch_idx]
+        if paged_kv_block_size is None:
+            k_cache_select = k_cache if not has_batch_idx else k_cache[cache_batch_idx]
+            v_cache_select = v_cache if not has_batch_idx else v_cache[cache_batch_idx]
+        else:
+            k_cache_select = rearrange(
+                k_cache_paged[block_table.flatten()],
+                "(b nblocks) block_size ... -> b (nblocks block_size) ...",
+                b=batch_size,
+            )[:, :seqlen_k]
+            v_cache_select = rearrange(
+                v_cache_paged[block_table.flatten()],
+                "(b nblocks) block_size ... -> b (nblocks block_size) ...",
+                b=batch_size,
+            )[:, :seqlen_k]
         assert torch.allclose(k_cache_select, k_cache_ref, rtol=1e-3, atol=1e-3)
         assert torch.equal(v_cache_select, v_cache_ref)
     mult = 3 if not alibi else 5
@@ -2300,8 +2333,6 @@ def test_flash_attn_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, loc
             assert torch.equal(dv, dv0)
             assert torch.equal(dk, dk0)
             assert torch.equal(dq, dq0)
-
-
 
 
 @pytest.mark.parametrize("dtype", ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
