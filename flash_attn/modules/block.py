@@ -13,9 +13,24 @@ from flash_attn.modules.mha import MHA
 from flash_attn.modules.mlp import Mlp
 
 try:
-    from flash_attn.ops.triton.layer_norm import layer_norm_fn, RMSNorm
+    from flash_attn.ops.layer_norm import dropout_add_layer_norm
 except ImportError:
-    layer_norm_fn, RMSNorm = None, None
+    dropout_add_layer_norm = None
+
+try:
+    from flash_attn.ops.layer_norm import dropout_add_layer_norm_parallel_residual
+except ImportError:
+    dropout_add_layer_norm_parallel_residual = None
+
+try:
+    from flash_attn.ops.rms_norm import RMSNorm, dropout_add_rms_norm
+except ImportError:
+    RMSNorm, dropout_add_rms_norm = None, None
+
+try:
+    from flash_attn.ops.rms_norm import dropout_add_rms_norm_parallel_residual
+except ImportError:
+    dropout_add_rms_norm_parallel_residual = None
 
 
 class Block(nn.Module):
@@ -76,7 +91,8 @@ class Block(nn.Module):
             self.norm2 = norm_cls(dim)
 
         if self.fused_dropout_add_ln:
-            assert layer_norm_fn is not None, "Triton is not installed"
+            assert dropout_add_layer_norm is not None, "dropout_layer_norm is not installed"
+            assert dropout_add_rms_norm is not None, "dropout_layer_norm is not installed"
             assert isinstance(self.norm1, (nn.LayerNorm, RMSNorm)) and isinstance(
                 self.dropout1, nn.Dropout
             )
@@ -121,6 +137,11 @@ class Block(nn.Module):
                 before applying the query projection. Useful for e.g., ViT where we only care
                 about the CLS token in the last layer.
         """
+        fused_add_norm_fn = (
+            dropout_add_rms_norm
+            if RMSNorm and isinstance(self.norm1, RMSNorm)
+            else dropout_add_layer_norm
+        )
         if self.prenorm:
             if not self.fused_dropout_add_ln:
                 dropped = self.drop_path1(self.dropout1(hidden_states))
@@ -139,17 +160,16 @@ class Block(nn.Module):
                             dtype=hidden_states.dtype,
                         )
                     )
-                hidden_states, residual = layer_norm_fn(
+                hidden_states, residual = fused_add_norm_fn(
                     hidden_states,
+                    residual,
                     self.norm1.weight,
                     self.norm1.bias,
-                    residual=residual,
-                    eps=self.norm1.eps,
-                    dropout_p=self.dropout1.p if self.training else 0.0,
+                    self.dropout1.p if self.training else 0.0,
+                    self.norm1.eps,
                     rowscale=rowscale1,
                     prenorm=True,
-                    residual_in_fp32=self.residual_in_fp32,
-                    is_rms_norm=isinstance(self.norm1, RMSNorm)
+                    residual_in_fp32=self.residual_in_fp32
                 )
             if mixer_kwargs is None:
                 mixer_kwargs = {}
@@ -176,17 +196,16 @@ class Block(nn.Module):
                                 dtype=hidden_states.dtype,
                             )
                         )
-                    hidden_states, residual = layer_norm_fn(
+                    hidden_states, residual = fused_add_norm_fn(
                         hidden_states,
+                        residual,
                         self.norm2.weight,
                         self.norm2.bias,
-                        residual=residual,
-                        eps=self.norm2.eps,
-                        dropout_p=self.dropout2.p if self.training else 0.0,
+                        self.dropout2.p if self.training else 0.0,
+                        self.norm2.eps,
                         rowscale=rowscale2,
                         prenorm=True,
                         residual_in_fp32=self.residual_in_fp32,
-                        is_rms_norm=isinstance(self.norm2, RMSNorm)
                     )
                 hidden_states = self.mlp(hidden_states)
             return hidden_states, residual
@@ -212,16 +231,15 @@ class Block(nn.Module):
                             mixer_out.shape[:-1], device=mixer_out.device, dtype=mixer_out.dtype
                         )
                     )
-                hidden_states = layer_norm_fn(
+                hidden_states = fused_add_norm_fn(
                     mixer_out,
+                    hidden_states,
                     self.norm1.weight,
                     self.norm1.bias,
-                    residual=hidden_states,
-                    eps=self.norm1.eps,
-                    dropout_p=self.dropout1.p if self.training else 0.0,
+                    self.dropout1.p if self.training else 0.0,
+                    self.norm1.eps,
                     rowscale=rowscale1,
                     prenorm=False,
-                    is_rms_norm=isinstance(self.norm1, RMSNorm)
                 )
             if not isinstance(self.mlp, nn.Identity):
                 mlp_out = self.mlp(hidden_states)
@@ -242,16 +260,15 @@ class Block(nn.Module):
                                 mlp_out.shape[:-1], device=mlp_out.device, dtype=mlp_out.dtype
                             )
                         )
-                    hidden_states = layer_norm_fn(
+                    hidden_states = fused_add_norm_fn(
                         mlp_out,
+                        hidden_states,
                         self.norm2.weight,
                         self.norm2.bias,
-                        residual=hidden_states,
-                        eps=self.norm2.eps,
-                        dropout_p=self.dropout2.p if self.training else 0.0,
+                        self.dropout2.p if self.training else 0.0,
+                        self.norm2.eps,
                         rowscale=rowscale2,
                         prenorm=False,
-                        is_rms_norm=isinstance(self.norm2, RMSNorm)
                     )
             return hidden_states
 
@@ -303,7 +320,12 @@ class ParallelBlock(nn.Module):
             self.norm2 = norm_cls(dim)
 
         if self.fused_dropout_add_ln:
-            assert layer_norm_fn is not None, "Triton is not installed"
+            assert (
+                dropout_add_layer_norm_parallel_residual is not None
+            ), "dropout_layer_norm is not installed"
+            assert (
+                dropout_add_rms_norm_parallel_residual is not None
+            ), "dropout_layer_norm is not installed"
             assert isinstance(self.norm1, (nn.LayerNorm, RMSNorm)) and isinstance(
                 self.dropout1, nn.Dropout
             )
@@ -348,6 +370,11 @@ class ParallelBlock(nn.Module):
         """
         # TODO: Ideally we should only do the allgather / allreduce once for
         # the Linear to MLP & Attention
+        fused_add_norm_fn = (
+            dropout_add_rms_norm_parallel_residual
+            if isinstance(self.norm1, RMSNorm)
+            else dropout_add_layer_norm_parallel_residual
+        )
         if not self.fused_dropout_add_ln:
             dropped1 = self.dropout1(hidden_states1)
             # For the very 1st block, we only want 1 dropout, not two different dropouts
@@ -372,24 +399,21 @@ class ParallelBlock(nn.Module):
             weight2, bias2 = (
                 (self.norm2.weight, self.norm2.bias) if not self.tied_norm else (None, None)
             )
-            hidden_states1, *rest, residual = layer_norm_fn(
+            hidden_states1, hidden_states2, residual = fused_add_norm_fn(
                 hidden_states1,
+                hidden_states2,
+                residual,
                 self.norm1.weight,
                 self.norm1.bias,
-                residual=residual,
-                x1=hidden_states2,
-                weight1=weight2,
-                bias1=bias2,
-                eps=self.norm1.eps,
-                dropout_p=self.dropout1.p if self.training else 0.0,
+                weight2,
+                bias2,
+                self.dropout1.p if self.training else 0.0,
+                self.norm1.eps,
                 prenorm=True,
                 residual_in_fp32=self.residual_in_fp32,
-                is_rms_norm=isinstance(self.norm1, RMSNorm)
             )
             if self.tied_norm:
                 hidden_states2 = hidden_states1
-            else:
-                hidden_states2, = rest
         if mixer_kwargs is None:
             mixer_kwargs = {}
         hidden_states1 = self.mixer(hidden_states1, **mixer_kwargs)
